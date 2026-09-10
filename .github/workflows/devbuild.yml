@@ -20,6 +20,9 @@ on:
 
 jobs:
   devbuild:
+    # Without this the job title is every matrix value joined together,
+    # avatar URL included.
+    name: ${{ matrix.target.label }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
