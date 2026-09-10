@@ -1,0 +1,98 @@
+name: Dev build
+
+# Builds each target and posts the resulting jar to a Discord webhook.
+#
+# Push-triggered only in practice: the upload message is built from the pushed
+# commit, so a manual dispatch has nothing to read. Callers should not offer a
+# workflow_dispatch that cannot work.
+
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: 'JSON array of {project, label, avatar, datagen?} objects.'
+        type: string
+        required: true
+      java:
+        type: string
+        required: false
+        default: '21'
+
+jobs:
+  devbuild:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+      - name: Set up JDK ${{ inputs.java }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java }}
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Restore DataGen cache
+        if: matrix.target.datagen
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ matrix.target.project }}/src/generated
+          key: datagen-${{ matrix.target.project }}-${{ github.run_id }}
+          restore-keys: datagen-${{ matrix.target.project }}-
+
+      - name: Run DataGen
+        if: matrix.target.datagen
+        run: ./gradlew -p ${{ matrix.target.project }} Data
+        continue-on-error: true
+
+      - name: Save DataGen cache
+        if: matrix.target.datagen
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ matrix.target.project }}/src/generated
+          key: ${{ steps.cache-restore.outputs.cache-primary-key }}
+
+      - name: Build ${{ matrix.target.label }}
+        run: ./gradlew -p ${{ matrix.target.project }} build
+
+      - name: Publish ${{ matrix.target.label }} artifacts
+        env:
+          WEBHOOK: ${{ secrets.DEV_BUILDS }}
+          REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          PROJECT: ${{ matrix.target.project }}
+          LABEL: ${{ matrix.target.label }}
+          AVATAR: ${{ matrix.target.avatar }}
+        run: |
+          set -euo pipefail
+          jar=$(ls "$PROJECT"/build/libs/*.jar | grep -vE -- '-(sources|dev|javadoc)[.]jar$' | head -1)
+          test -n "$jar" || { echo "no jar in $PROJECT/build/libs"; exit 1; }
+          echo "uploading $jar ($(du -h "$jar" | cut -f1))"
+          payload=$(jq -nc \
+            --arg u "$LABEL builds" \
+            --arg a "$AVATAR" \
+            --arg repo "$REPO" \
+            --arg run "$RUN_NUMBER" \
+            --arg m "$COMMIT_MSG" \
+            --arg url "$COMMIT_URL" \
+            '{username: $u, avatar_url: $a, content: ("<:new1:1253371736510959636><:new2:1253371805734015006> New `\($repo)` dev build `#\($run)`:\n> :sparkles: [\($m)](<\($url)>)")}')
+          # --form-string, not -F: curl reads ';' in an -F value as a parameter
+          # separator, so a commit message containing one truncates the JSON and
+          # Discord rejects the request with a 400.
+          curl -sS --fail-with-body -X POST "$WEBHOOK" \
+            --form-string "payload_json=$payload" \
+            -F "files[0]=@$jar"
