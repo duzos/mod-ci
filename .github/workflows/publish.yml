@@ -1,0 +1,104 @@
+name: Publish
+
+# Builds and publishes a matrix of Gradle subprojects. A "target" is one
+# subproject: for a multiloader repo those are fabric/forge, for a multimodule
+# repo they are core/addon-*, and for a flat repo there is one target with no
+# project at all. Same axis either way.
+
+on:
+  workflow_call:
+    inputs:
+      targets:
+        description: 'JSON array of {project?, datagen?} objects. Default is one root-project build.'
+        type: string
+        required: false
+        default: '[{}]'
+      java:
+        type: string
+        required: false
+        default: '21'
+      task:
+        description: 'Gradle publish task name, e.g. publishMods, publishModrinth, publishCurseforge.'
+        type: string
+        required: false
+        default: 'publishMods'
+      dry_run:
+        description: 'Run the publish task with PUBLISH_DRY_RUN=true so nothing is uploaded.'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      # Sequential, so a failure part-way through does not leave some artifacts
+      # published against a version the others never reached.
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+      - name: Set up JDK ${{ inputs.java }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java }}
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Resolve gradle paths
+        id: g
+        run: |
+          set -euo pipefail
+          p='${{ matrix.target.project }}'
+          if [ -z "$p" ] || [ "$p" = "." ]; then
+            echo "dir=."                          >> "$GITHUB_OUTPUT"
+            echo "task=:${{ inputs.task }}"       >> "$GITHUB_OUTPUT"
+            echo "label=root"                     >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=$p"                         >> "$GITHUB_OUTPUT"
+            echo "task=:$p:${{ inputs.task }}"    >> "$GITHUB_OUTPUT"
+            echo "label=$p"                       >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore DataGen cache
+        if: matrix.target.datagen
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.g.outputs.dir }}/src/generated
+          key: datagen-${{ steps.g.outputs.label }}-${{ github.run_id }}
+          restore-keys: datagen-${{ steps.g.outputs.label }}-
+
+      - name: Run DataGen
+        if: matrix.target.datagen
+        run: ./gradlew -p ${{ steps.g.outputs.dir }} Data
+        continue-on-error: true
+
+      - name: Save DataGen cache
+        if: matrix.target.datagen
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.g.outputs.dir }}/src/generated
+          key: ${{ steps.cache-restore.outputs.cache-primary-key }}
+
+      - name: Build ${{ steps.g.outputs.label }}
+        run: ./gradlew -p ${{ steps.g.outputs.dir }} build
+
+      - name: Publish ${{ steps.g.outputs.label }}
+        run: ./gradlew ${{ steps.g.outputs.task }}
+        env:
+          PUBLISH_DRY_RUN: ${{ inputs.dry_run }}
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          CURSEFORGE_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
