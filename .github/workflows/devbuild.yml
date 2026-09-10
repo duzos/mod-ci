@@ -5,24 +5,32 @@ name: Dev build
 # Push-triggered only in practice: the upload message is built from the pushed
 # commit, so a manual dispatch has nothing to read. Callers should not offer a
 # workflow_dispatch that cannot work.
+#
+# Targets take the same shape as publish.yml's, so a caller can pass one value
+# to both.
 
 on:
   workflow_call:
     inputs:
       targets:
-        description: 'JSON array of {project, label, avatar, datagen?} objects.'
+        description: 'JSON array of {project?, datagen?} objects. Default is one root-project build.'
         type: string
-        required: true
+        required: false
+        default: '[{}]'
       java:
         type: string
         required: false
         default: '21'
+      avatar:
+        description: 'Webhook avatar URL. Defaults to the README logo, then the owner avatar.'
+        type: string
+        required: false
+        default: ''
 
 jobs:
   devbuild:
-    # Without this the job title is every matrix value joined together,
-    # avatar URL included.
-    name: ${{ matrix.target.label }}
+    # Without this the job title is every matrix value joined together.
+    name: ${{ matrix.target.project || 'root' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,53 +54,94 @@ jobs:
           distribution: 'temurin'
           cache: 'gradle'
 
+      - name: Resolve gradle paths
+        id: g
+        run: |
+          set -euo pipefail
+          p='${{ matrix.target.project }}'
+          if [ -z "$p" ] || [ "$p" = "." ]; then
+            echo "dir=."    >> "$GITHUB_OUTPUT"
+            echo "label="   >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=$p"   >> "$GITHUB_OUTPUT"
+            echo "label=$p" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Restore DataGen cache
         if: matrix.target.datagen
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
-          path: ${{ matrix.target.project }}/src/generated
+          path: ${{ steps.g.outputs.dir }}/src/generated
           key: datagen-${{ matrix.target.project }}-${{ github.run_id }}
           restore-keys: datagen-${{ matrix.target.project }}-
 
       - name: Run DataGen
         if: matrix.target.datagen
-        run: ./gradlew -p ${{ matrix.target.project }} Data
+        run: ./gradlew -p ${{ steps.g.outputs.dir }} Data
         continue-on-error: true
 
       - name: Save DataGen cache
         if: matrix.target.datagen
         uses: actions/cache/save@v4
         with:
-          path: ${{ matrix.target.project }}/src/generated
+          path: ${{ steps.g.outputs.dir }}/src/generated
           key: ${{ steps.cache-restore.outputs.cache-primary-key }}
 
-      - name: Build ${{ matrix.target.label }}
-        run: ./gradlew -p ${{ matrix.target.project }} build
+      - name: Build ${{ steps.g.outputs.dir }}
+        run: ./gradlew -p ${{ steps.g.outputs.dir }} build
 
-      - name: Publish ${{ matrix.target.label }} artifacts
+      - name: Publish ${{ steps.g.outputs.dir }} artifacts
         env:
           WEBHOOK: ${{ secrets.DEV_BUILDS }}
           REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
           RUN_NUMBER: ${{ github.run_number }}
           COMMIT_MSG: ${{ github.event.head_commit.message }}
           COMMIT_URL: ${{ github.event.head_commit.url }}
-          PROJECT: ${{ matrix.target.project }}
-          LABEL: ${{ matrix.target.label }}
-          AVATAR: ${{ matrix.target.avatar }}
+          DIR: ${{ steps.g.outputs.dir }}
+          LABEL: ${{ steps.g.outputs.label }}
+          AVATAR: ${{ inputs.avatar }}
         run: |
           set -euo pipefail
-          jar=$(ls "$PROJECT"/build/libs/*.jar | grep -vE -- '-(sources|dev|javadoc)[.]jar$' | head -1)
-          test -n "$jar" || { echo "no jar in $PROJECT/build/libs"; exit 1; }
+
+          jar=$(ls "$DIR"/build/libs/*.jar | grep -vE -- '-(sources|dev|javadoc)[.]jar$' | head -1)
+          test -n "$jar" || { echo "no jar in $DIR/build/libs"; exit 1; }
           echo "uploading $jar ($(du -h "$jar" | cut -f1))"
+
+          # "<repo>/<module> builds", or just "<repo> builds" for a root build.
+          name="${REPO#*/}"
+          if [ -n "$LABEL" ]; then name="$name/$LABEL"; fi
+          name="$name builds"
+
+          # Avatar: the explicit input, else the first repo-relative image in
+          # the README, else the owner avatar. Empty posts without one.
+          avatar="$AVATAR"
+          if [ -z "$avatar" ] && [ -f README.md ]; then
+            rel=$(grep -oE '<img[^>]+src="[^"]+"|!\[[^]]*\]\([^) ]+' README.md \
+              | sed -E 's/.*src="([^"]+)".*/\1/; s/^!\[[^]]*\]\(//' \
+              | grep -vE '^(https?:)?//|^data:' | head -1 | sed 's|^\./||') || true
+            if [ -n "$rel" ]; then
+              cand="https://raw.githubusercontent.com/$REPO/$SHA/$rel"
+              curl -sfI --max-time 15 -o /dev/null "$cand" && avatar="$cand" || true
+            fi
+          fi
+          if [ -z "$avatar" ]; then
+            cand="https://github.com/${REPO%%/*}.png"
+            curl -sfI --max-time 15 -o /dev/null "$cand" && avatar="$cand" || true
+          fi
+          echo "avatar: ${avatar:-<none>}"
+
           payload=$(jq -nc \
-            --arg u "$LABEL builds" \
-            --arg a "$AVATAR" \
+            --arg u "$name" \
+            --arg a "$avatar" \
             --arg repo "$REPO" \
             --arg run "$RUN_NUMBER" \
             --arg m "$COMMIT_MSG" \
             --arg url "$COMMIT_URL" \
-            '{username: $u, avatar_url: $a, content: ("<:new1:1253371736510959636><:new2:1253371805734015006> New `\($repo)` dev build `#\($run)`:\n> :sparkles: [\($m)](<\($url)>)")}')
+            '{username: $u, content: ("<:new1:1253371736510959636><:new2:1253371805734015006> New `\($repo)` dev build `#\($run)`:\n> :sparkles: [\($m)](<\($url)>)")}
+             | if $a == "" then . else . + {avatar_url: $a} end')
+
           # --form-string, not -F: curl reads ';' in an -F value as a parameter
           # separator, so a commit message containing one truncates the JSON and
           # Discord rejects the request with a 400.
