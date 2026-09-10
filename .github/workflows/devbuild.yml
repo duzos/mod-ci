@@ -101,6 +101,8 @@ jobs:
           COMMIT_URL: ${{ github.event.head_commit.url }}
           DIR: ${{ steps.g.outputs.dir }}
           LABEL: ${{ steps.g.outputs.label }}
+          BRANCH: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           AVATAR: ${{ inputs.avatar }}
         run: |
           set -euo pipefail
@@ -112,23 +114,29 @@ jobs:
           test -n "$jar" || { echo "no jar in $DIR/build/libs"; exit 1; }
           echo "uploading $jar ($(du -h "$jar" | cut -f1))"
 
-          # "<repo>/<module> builds", or just "<repo> builds" for a root build.
+          # "<repo>/<module>/<branch> builds", dropping the module for a
+          # root build and the branch when it is the default one.
           name="${REPO#*/}"
           if [ -n "$LABEL" ]; then name="$name/$LABEL"; fi
+          if [ -n "$BRANCH" ] && [ "$BRANCH" != "$DEFAULT_BRANCH" ]; then
+            name="$name/$BRANCH"
+          fi
           name="$name builds"
 
-          # Avatar: the explicit input, else the first repo-relative image in
-          # the README, else the owner avatar. Empty posts without one.
+          # Avatar: the explicit input, else the first repo-relative image
+          # in the module README, else the root one, else the owner avatar.
+          # Empty posts without one.
           avatar="$AVATAR"
-          if [ -z "$avatar" ] && [ -f README.md ]; then
-            rel=$(grep -oE '<img[^>]+src="[^"]+"|!\[[^]]*\]\([^) ]+' README.md \
-              | sed -E 's/.*src="([^"]+)".*/\1/; s/^!\[[^]]*\]\(//' \
-              | grep -vE '^(https?:)?//|^data:' | head -1 | sed 's|^\./||') || true
-            if [ -n "$rel" ]; then
-              cand="https://raw.githubusercontent.com/$REPO/$SHA/$rel"
-              curl -sfI --max-time 15 -o /dev/null "$cand" && avatar="$cand" || true
-            fi
-          fi
+          for readme in "$DIR/README.md" README.md; do
+            [ -n "$avatar" ] && break
+            [ -f "$readme" ] || continue
+            rel=$(grep -oE '<img[^>]+src="[^"]+"|!\[[^]]*\]\([^) ]+' "$readme"               | sed -E 's/.*src="([^"]+)".*/\1/; s/^!\[[^]]*\]\(//'               | grep -vE '^(https?:)?//|^data:' | head -1) || true
+            [ -n "$rel" ] || continue
+            # The path is relative to the README, and core's points at ../img.
+            path=$(realpath -m --relative-to=. "$(dirname "$readme")/$rel")
+            cand="https://raw.githubusercontent.com/$REPO/$SHA/$path"
+            curl -sfI --max-time 15 -o /dev/null "$cand" && avatar="$cand" || true
+          done
           if [ -z "$avatar" ]; then
             cand="https://github.com/${REPO%%/*}.png"
             curl -sfI --max-time 15 -o /dev/null "$cand" && avatar="$cand" || true
