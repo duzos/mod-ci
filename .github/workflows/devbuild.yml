@@ -105,6 +105,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Only the subject: a multi-line body breaks the markdown link.
+          subject=$(printf '%s' "$COMMIT_MSG" | head -1)
+
           jar=$(ls "$DIR"/build/libs/*.jar | grep -vE -- '-(sources|dev|javadoc)[.]jar$' | head -1)
           test -n "$jar" || { echo "no jar in $DIR/build/libs"; exit 1; }
           echo "uploading $jar ($(du -h "$jar" | cut -f1))"
@@ -137,7 +140,7 @@ jobs:
             --arg a "$avatar" \
             --arg repo "$REPO" \
             --arg run "$RUN_NUMBER" \
-            --arg m "$COMMIT_MSG" \
+            --arg m "$subject" \
             --arg url "$COMMIT_URL" \
             '{username: $u, content: ("<:new1:1253371736510959636><:new2:1253371805734015006> New `\($repo)` dev build `#\($run)`:\n> :sparkles: [\($m)](<\($url)>)")}
              | if $a == "" then . else . + {avatar_url: $a} end')
