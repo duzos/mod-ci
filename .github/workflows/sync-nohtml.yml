@@ -1,0 +1,74 @@
+name: Sync README_nohtml.md
+
+# Regenerates each module's README_nohtml.md (pure markdown for CurseForge) from
+# its README.md, and commits the result back to the calling repo's branch.
+#
+# The push uses the default GITHUB_TOKEN, whose pushes deliberately do not
+# trigger workflows. That is what keeps this from re-triggering itself.
+
+on:
+  workflow_call:
+    inputs:
+      modules:
+        description: 'JSON array of module directories. Use ["."] for a flat repo.'
+        type: string
+        required: false
+        default: '["."]'
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      # No `repository:`, so this is the CALLER's repo.
+      - uses: actions/checkout@v4
+
+      # mod-ci itself, for the script. GitHub does not expose the tag a reusable
+      # workflow was called at in a usable expression, so this is pinned
+      # explicitly. Bump it in the same commit that cuts a new major tag.
+      - uses: actions/checkout@v4
+        with:
+          repository: duzos/mod-ci
+          ref: v1
+          path: .mod-ci
+
+      - name: Generate README_nohtml.md for each module
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo '${{ inputs.modules }}' > modules.json
+          python3 - <<'PY' > module_list.txt
+          import json
+          with open("modules.json", encoding="utf-8") as f:
+              for m in json.load(f):
+                  print(m)
+          PY
+          while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            if [ "$m" = "." ]; then
+              in="README.md"; out="README_nohtml.md"
+            else
+              in="$m/README.md"; out="$m/README_nohtml.md"
+            fi
+            if [ ! -f "$in" ]; then
+              echo "no $in, skipping"
+              continue
+            fi
+            echo "generating $out"
+            python3 .mod-ci/scripts/readme_to_markdown.py "$in" "$out" "$m"
+          done < module_list.txt
+          rm -f modules.json module_list.txt
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- '*README_nohtml.md' 'README_nohtml.md'; then
+            echo "README_nohtml.md files already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- $(git diff --name-only -- '*README_nohtml.md' 'README_nohtml.md')
+          git commit -m "docs: regenerate README_nohtml.md"
+          git push
